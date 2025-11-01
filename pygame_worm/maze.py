@@ -5,6 +5,7 @@ from typing import List, Tuple
 import math
 
 import pygame as pg
+from .spatial import SpatialHash
 
 
 Color = Tuple[int, int, int]
@@ -121,6 +122,10 @@ class Maze:
         self.food_prob: float = 0.85
         self.food_radius: int = 3
         self.foods: List[Food] = []
+        self._available_food_count: int = 0
+        # Spatial hash for foods for fast neighborhood queries
+        # Cell size roughly a few body radii for good locality
+        self.food_grid = SpatialHash(cell_size=120.0)
         self.bounds = pg.Rect(0, 0, size[0], size[1])
         self._generate_default()
 
@@ -140,7 +145,10 @@ class Maze:
                     break
             if blocked:
                 continue
-            self.foods.append(Food(float(fx), float(fy)))
+            f = Food(float(fx), float(fy))
+            self.foods.append(f)
+            self._available_food_count += 1
+            self.food_grid.insert(f, f.x, f.y)
             return True
         return False
 
@@ -195,6 +203,8 @@ class Maze:
 
         # Scatter food items roughly foods_per_cell per grid cell on average
         self.foods = []
+        self.food_grid.clear()
+        self._available_food_count = 0
         foods_per_cell = max(0, int(self.foods_per_cell))
         for r in range(rows):
             for c in range(cols):
@@ -211,19 +221,39 @@ class Maze:
                                     blocked = True
                                     break
                             if not blocked:
-                                self.foods.append(Food(float(fx), float(fy)))
+                                f = Food(float(fx), float(fy))
+                                self.foods.append(f)
+                                self.food_grid.insert(f, f.x, f.y)
+                                self._available_food_count += 1
                                 placed = True
                                 break
 
     def regenerate(self) -> None:
         self._generate_default()
 
+    # ---- Food helpers ----
+    def available_food(self) -> int:
+        return self._available_food_count
+
+    def mark_food_eaten(self, f: Food) -> None:
+        if not f.eaten:
+            f.eaten = True
+            self._available_food_count = max(0, self._available_food_count - 1)
+            self.food_grid.remove(f)
+
+    def foods_near(self, x: float, y: float, r: float) -> List[Food]:
+        # Query spatial hash and filter uneaten
+        return [f for f in self.food_grid.query_radius(x, y, r) if not getattr(f, 'eaten', False)]
+
     def draw(self, surf: pg.Surface, cam: Tuple[float, float]) -> None:
         # Background for current viewport
         surf.fill((9, 12, 24))
         cx, cy = cam
-        # Walls/blocks with camera offset - draw as ellipses
+        # Walls/blocks with camera offset - draw as ellipses (cull to viewport)
+        view = pg.Rect(int(cx), int(cy), surf.get_width(), surf.get_height())
         for obs in self.obstacles:
+            if not view.colliderect(obs.rect):
+                continue
             r = obs.rect.move(-int(cx), -int(cy))
             pg.draw.ellipse(surf, (34, 45, 78), r)
         # Border (world bounds) offset by camera
@@ -232,7 +262,8 @@ class Maze:
         # Foods within viewport
         vw = surf.get_width()
         vh = surf.get_height()
-        for f in self.foods:
+        # Draw foods in viewport using spatial query to reduce iteration cost
+        for f in self.food_grid.query_radius(cx + vw * 0.5, cy + vh * 0.5, max(vw, vh) * 0.8):
             if f.eaten:
                 continue
             sx = int(f.x - cx)
@@ -253,8 +284,13 @@ class Maze:
             rw = max(1, int(obs.rect.w * sx))
             rh = max(1, int(obs.rect.h * sy))
             pg.draw.ellipse(surf, (30, 42, 70), pg.Rect(rx, ry, rw, rh))
-        # Foods
-        for f in self.foods:
+        # Foods (sample to avoid drawing too many points)
+        max_food_draw = 1500
+        n_foods = len(self.foods)
+        step = max(1, n_foods // max_food_draw)
+        for idx, f in enumerate(self.foods):
+            if idx % step != 0:
+                continue
             if f.eaten:
                 continue
             px = dest.x + int(f.x * sx)

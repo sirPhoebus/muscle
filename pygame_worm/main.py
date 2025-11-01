@@ -39,7 +39,7 @@ BASE_BODY_RADIUS = 10.0
 WAVE_PHASE_PER_SEG = 0.45  # radians per segment
 
 # Life simulation globals
-STARVATION_TIME_S = 600.0            # die if no food within this time
+STARVATION_TIME_S = 60.0            # die if no food within this time
 REPRODUCTION_FOOD_REQUIRED = 5      # foods needed to be "ready"
 REPRODUCTION_DISTANCE_SCALE = 1.0   # how close heads must be (× sum of radii)
 REPRODUCTION_COOLDOWN_S = 5.0       # seconds before a parent can reproduce again
@@ -47,8 +47,10 @@ REPRODUCTION_COOLDOWN_S = 5.0       # seconds before a parent can reproduce agai
 
 
 # Food spawn timing
-FOOD_SPAWN_MIN_S = 5.0
-FOOD_SPAWN_MAX_S = 30.0
+FOOD_SPAWN_MIN_S = 2.0
+FOOD_SPAWN_MAX_S = 12.0
+FOOD_TARGET_PER_WORM = 0.6  # aim for this many available foods per worm
+FOOD_SPAWN_BURST_MAX = 10   # max foods to add in one spawn
 
 # DNA visualization parameter specs: (attr_name, min, max)
 DNA_SPECS: List[Tuple[str, float, float]] = [
@@ -222,6 +224,8 @@ class Worm:
         tag_x = x - total_w // 2
         tag_y = y - int(self.body_radius) - total_h - 6
         rect = pg.Rect(tag_x, tag_y, total_w, total_h)
+        # Save for hit-testing (screen space)
+        self.last_tag_rect = rect.copy()
         # Background and border
         bg = (18, 22, 32)
         bd = (70, 80, 110) if not self.ready_to_mate else (70, 160, 90)
@@ -278,35 +282,50 @@ class Worm:
             self.alive = False
             return
 
-        # Sensor rays from head
+        # Sensor rays from head (throttled)
         hx, hy = self.head_pos()
         hdir = self.head_dir()
         sensor_fov = math.radians(params.sensor_fov_deg)
-        # Build a fan of rays across [-FOV, +FOV]
-        n = max(3, int(params.sensor_fan_rays))
-        if n % 2 == 0:
-            n += 1  # prefer odd to have a center ray
-        self.last_sensor_fan = []
-        for i in range(n):
-            t = -1.0 + 2.0 * (i / max(1, n - 1))  # -1..1
-            ang = hdir + t * sensor_fov
-            tip = (hx + self.body_radius * math.cos(ang), hy + self.body_radius * math.sin(ang))
-            d = maze.raycast(tip, ang, params.sensor_range)
-            self.last_sensor_fan.append((tip, ang, d))
-        # Derive left/right endpoint and center samples for compatibility
-        angL = hdir - sensor_fov
-        angR = hdir + sensor_fov
-        tipL = (hx + self.body_radius * math.cos(angL), hy + self.body_radius * math.sin(angL))
-        tipR = (hx + self.body_radius * math.cos(angR), hy + self.body_radius * math.sin(angR))
-        dL = maze.raycast(tipL, angL, params.sensor_range)
-        dR = maze.raycast(tipR, angR, params.sensor_range)
-        tipC = (hx + self.body_radius * math.cos(hdir), hy + self.body_radius * math.sin(hdir))
-        dC = maze.raycast(tipC, hdir, params.sensor_range)
-        # cache for drawing
-        self.last_sensor_L = dL
-        self.last_sensor_R = dR
-        self.last_sensor_origin_L = tipL
-        self.last_sensor_origin_R = tipR
+        # Determine if we should recompute sensors this frame
+        # Throttle based on worm id to stagger updates
+        if not hasattr(self, "_sensor_frame_mod"):
+            self._sensor_frame_mod = np.random.randint(0, 3)
+        recompute = (int(t_sec * 60) + self._sensor_frame_mod) % 3 == 0
+        if recompute:
+            # Build a fan of rays across [-FOV, +FOV]
+            n = max(3, int(params.sensor_fan_rays))
+            # Dynamic cap to reduce cost with many agents
+            n = int(max(3, min(n, 9)))
+            if n % 2 == 0:
+                n += 1  # prefer odd to have a center ray
+            fan: List[Tuple[Tuple[float, float], float, float]] = []
+            for i in range(n):
+                t = -1.0 + 2.0 * (i / max(1, n - 1))  # -1..1
+                ang = hdir + t * sensor_fov
+                tip = (hx + self.body_radius * math.cos(ang), hy + self.body_radius * math.sin(ang))
+                d = maze.raycast(tip, ang, params.sensor_range)
+                fan.append((tip, ang, d))
+            self.last_sensor_fan = fan
+            # Derive endpoints
+            angL = hdir - sensor_fov
+            angR = hdir + sensor_fov
+            tipL = (hx + self.body_radius * math.cos(angL), hy + self.body_radius * math.sin(angL))
+            tipR = (hx + self.body_radius * math.cos(angR), hy + self.body_radius * math.sin(angR))
+            dL = maze.raycast(tipL, angL, params.sensor_range)
+            dR = maze.raycast(tipR, angR, params.sensor_range)
+            tipC = (hx + self.body_radius * math.cos(hdir), hy + self.body_radius * math.sin(hdir))
+            dC = maze.raycast(tipC, hdir, params.sensor_range)
+            self._last_dists = (dL, dR, dC)
+            # cache for drawing
+            self.last_sensor_L = dL
+            self.last_sensor_R = dR
+            self.last_sensor_origin_L = tipL
+            self.last_sensor_origin_R = tipR
+        else:
+            # Reuse last results if available
+            dL, dR, dC = getattr(self, "_last_dists", (params.sensor_range, params.sensor_range, params.sensor_range))
+            self.last_sensor_L = dL
+            self.last_sensor_R = dR
         # Sensor bias: steer away from nearer obstacle
         bias = 0.0
         # Vector-field avoidance using the multi-ray fan
@@ -331,21 +350,18 @@ class Worm:
         if not params.neurons_enabled:
             bias = 0.0
 
-        # Food attraction: steer toward resultant vector of nearby foods
+        # Food attraction: steer toward resultant vector of nearby foods (spatial query)
         if params.neurons_enabled and params.attract_gain > 0.0:
             hx, hy = self.head_pos()
             acc = np.array([0.0, 0.0], dtype=float)
-            # Quick neighborhood scan: consider all foods and weight by distance
-            # For performance, foods are modest count; otherwise spatial index would help
-            for f in maze.foods:
-                if f.eaten:
-                    continue
+            for f in maze.foods_near(hx, hy, params.food_range):
                 dx = f.x - hx
                 dy = f.y - hy
                 dist = math.hypot(dx, dy)
-                if dist <= params.food_range and dist > 1e-3:
+                if dist > 1e-3:
                     w = max(0.0, 1.0 - dist / params.food_range)
-                    acc += (w / dist) * np.array([dx, dy])
+                    acc[0] += (w / dist) * dx
+                    acc[1] += (w / dist) * dy
             mag = float(np.linalg.norm(acc))
             if mag > 1e-6:
                 acc /= mag
@@ -376,8 +392,8 @@ class Worm:
             if self.current_target is None:
                 best_f: Food | None = None
                 best_d = float('inf')
-                for f in maze.foods:
-                    if f.eaten or _is_avoided(f):
+                for f in maze.foods_near(hx, hy, params.food_range):
+                    if _is_avoided(f):
                         continue
                     d = math.hypot(f.x - hx, f.y - hy)
                     if d < best_d:
@@ -535,19 +551,17 @@ class Worm:
         hx, hy = self.head_pos()
         eat_r = self.body_radius * 1.2
         er2 = eat_r * eat_r
-        for f in maze.foods:
-            if f.eaten:
-                continue
+        for f in maze.foods_near(hx, hy, eat_r):
             dx = f.x - hx
             dy = f.y - hy
-            if (dx * dx + dy * dy) <= er2:
-                f.eaten = True
+            if (dx * dx + dy * dy) <= er2 and not f.eaten:
+                maze.mark_food_eaten(f)
                 self.food_eaten += 1
                 self.time_since_last_eat = 0.0
                 if self.food_eaten >= REPRODUCTION_FOOD_REQUIRED:
                     self.ready_to_mate = True
 
-    def draw(self, surf: pg.Surface, cam: Tuple[float, float], draw_sensors: bool = False) -> None:
+    def draw(self, surf: pg.Surface, cam: Tuple[float, float], draw_sensors: bool = False, draw_dna: bool = False, lite_mode: bool = False) -> None:
         params = self.params  # Use worm's own genetic parameters
         if not self.alive:
             return
@@ -567,29 +581,34 @@ class Worm:
 
         # Draw body segments with simple shading indicating left/right activation
         cx, cy = cam
-        for i, seg in enumerate(reversed(self.segs)):
+        segs_iter = list(reversed(self.segs))
+        step = 3 if lite_mode else 1
+        for idx in range(0, len(segs_iter), step):
+            seg = segs_iter[idx]
             # back to front - use worm's own body radius
-            r = self.body_radius * (0.9 + 0.12 * math.sin(0.6 * i))
+            r = self.body_radius * (0.9 + 0.12 * math.sin(0.6 * idx))
             x, y = float(seg.pos[0]) - cx, float(seg.pos[1]) - cy
             # base body with worm's color
             body_col = self.color if not getattr(self, 'ready_to_mate', False) else (255, 120, 180)
             pg.draw.circle(surf, body_col, (int(x), int(y)), int(r))
-            # dorsal/ventral shading by left/right activations
-            lcol = (255, 120, 110)
-            rcol = (210, 220, 230)
-            la = int(255 * seg.left.activation)
-            ra = int(255 * seg.right.activation)
-            # left/right small arcs
-            angle = seg.dir
-            lx = x + 0.5 * r * math.cos(angle + math.pi / 2)
-            ly = y + 0.5 * r * math.sin(angle + math.pi / 2)
-            rx = x + 0.5 * r * math.cos(angle - math.pi / 2)
-            ry = y + 0.5 * r * math.sin(angle - math.pi / 2)
-            pg.draw.circle(surf, (lcol[0], max(0, lcol[1] - (255 - la)), max(0, lcol[2] - (255 - la))), (int(lx), int(ly)), int(max(3, 0.35 * r)))
-            pg.draw.circle(surf, (rcol[0], max(0, rcol[1] - (255 - ra)), max(0, rcol[2] - (255 - ra))), (int(rx), int(ry)), int(max(3, 0.35 * r)))
+            if not lite_mode:
+                # dorsal/ventral shading by left/right activations
+                lcol = (255, 120, 110)
+                rcol = (210, 220, 230)
+                la = int(255 * seg.left.activation)
+                ra = int(255 * seg.right.activation)
+                # left/right small arcs
+                angle = seg.dir
+                lx = x + 0.5 * r * math.cos(angle + math.pi / 2)
+                ly = y + 0.5 * r * math.sin(angle + math.pi / 2)
+                rx = x + 0.5 * r * math.cos(angle - math.pi / 2)
+                ry = y + 0.5 * r * math.sin(angle - math.pi / 2)
+                pg.draw.circle(surf, (lcol[0], max(0, lcol[1] - (255 - la)), max(0, lcol[2] - (255 - la))), (int(lx), int(ly)), int(max(3, 0.35 * r)))
+                pg.draw.circle(surf, (rcol[0], max(0, rcol[1] - (255 - ra)), max(0, rcol[2] - (255 - ra))), (int(rx), int(ry)), int(max(3, 0.35 * r)))
 
         # Draw DNA tag above the head
-        self.draw_dna_tag(surf, cam)
+        if draw_dna:
+            self.draw_dna_tag(surf, cam)
 
 
 class Slider:
@@ -956,6 +975,20 @@ def run() -> None:
     pg.display.set_caption("Worm — Neuron & Muscle Fibers (Pygame) - 100 Worms")
     screen = pg.display.set_mode(WIN_SIZE)
     clock = pg.time.Clock()
+    # Optional GPU renderer (ModernGL) toggle via --gl or GL=1
+    import os as _os
+    use_gl = ('--gl' in sys.argv) or (_os.environ.get('GL', '0') == '1')
+    if use_gl:
+        try:
+            pg.display.set_mode(WIN_SIZE, pg.OPENGL | pg.DOUBLEBUF)
+            import moderngl  # type: ignore
+            from .gl_renderer import GLRenderer, CircleInstance
+            ctx = moderngl.create_context()
+            glr = GLRenderer(ctx, WIN_SIZE)
+            screen = None
+        except Exception as e:
+            print("Falling back to CPU renderer:", e, file=sys.stderr)
+            use_gl = False
 
     maze = Maze(WORLD_SIZE, margin=20)
     base_params = Params()  # Base genetics
@@ -1010,7 +1043,7 @@ def run() -> None:
     neuron_btn = Button(pg.Rect(WIN_SIZE[0] - 260, 70, 180, 28), "Neurons (Main Worm)", get_on=lambda: main_worm.params.neurons_enabled, on_toggle=lambda v: setattr(main_worm.params, "neurons_enabled", bool(v)))
 
     # UI visibility toggle
-    show_ui = True
+    show_ui = False
     # Camera mode: False = follow main worm, True = overview
     camera_overview = True
     # Manual camera position (used in overview mode)
@@ -1025,6 +1058,27 @@ def run() -> None:
     def _schedule_next_food_spawn(now: float) -> float:
         return now + _random.uniform(FOOD_SPAWN_MIN_S, FOOD_SPAWN_MAX_S)
     next_food_spawn_t = _schedule_next_food_spawn(t_sec)
+    # Stats logging setup
+    import os, csv
+    from datetime import datetime
+    stats_dir = os.path.join('.', 'stats')
+    os.makedirs(stats_dir, exist_ok=True)
+    initial_food_total = sum(1 for f in maze.foods if not f.eaten)
+    food_spawned_count = 0
+    stats_log = {
+        't': [],
+        'pop': [],
+        'ready': [],
+        'births': [],
+        'deaths': [],
+        'food_avail': [],
+        'food_total': [],
+        'food_ratio': [],
+        'avg_spd': [],
+        'max_spd': [],
+    }
+    # Downsampled stats tracking
+    globals()['_last_stats_t'] = -1.0
     # Life-sim counters
     births_count = 0
     deaths_count = 0
@@ -1052,8 +1106,8 @@ def run() -> None:
                 elif ev.key == pg.K_r:
                     maze.regenerate()
                 elif ev.key == pg.K_c:
-                    # Reload slider config and rebuild sliders
-                    sliders = build_sliders(params, main_worm, maze, start=(WIN_SIZE[0] - 260, 120))
+                    # Reload slider config and rebuild sliders for current main worm
+                    sliders = build_sliders(main_worm.params, main_worm, maze, start=(WIN_SIZE[0] - 260, 120))
                     slider_panel = ScrollableSliderPanel(slider_panel_rect, sliders)
                 elif ev.key == pg.K_h:
                     show_ui = not show_ui
@@ -1063,6 +1117,9 @@ def run() -> None:
                     if camera_overview:
                         # Reset to center when switching to overview
                         manual_cam_target = np.array([WORLD_SIZE[0] * 0.5, WORLD_SIZE[1] * 0.5], dtype=float)
+                elif ev.key == pg.K_s:
+                    # Stop simulation and show final statistics
+                    running = False
             elif ev.type == pg.MOUSEBUTTONDOWN and ev.button == 1:
                 # Click on minimap: teleport camera to world position or nearest worm
                 if mini_rect.collidepoint(ev.pos):
@@ -1084,6 +1141,15 @@ def run() -> None:
                         world_x, world_y = nearest
                     camera_overview = True
                     manual_cam_target = np.array([world_x, world_y], dtype=float)
+                elif ( not (show_ui and slider_panel_rect.collidepoint(ev.pos))) and any((getattr(w, 'last_tag_rect', None) is not None) and getattr(w,'last_tag_rect').collidepoint(ev.pos) for w in worms):
+                    for w in worms:
+                        r = getattr(w, 'last_tag_rect', None)
+                        if r is not None and r.collidepoint(ev.pos):
+                            main_worm = w
+                            sliders = build_sliders(main_worm.params, main_worm, maze, start=(WIN_SIZE[0] - 260, 120))
+                            slider_panel = ScrollableSliderPanel(slider_panel_rect, sliders)
+                            show_ui = True
+                            break
                 # Click on main viewport in overview mode: move camera target directly
                 elif camera_overview and (ev.pos[0] < WIN_SIZE[0] - 300 or not show_ui):
                     world_x = ev.pos[0] + cam[0]
@@ -1114,9 +1180,17 @@ def run() -> None:
         for w in worms:
             w.update(dt_ms, t_sec, maze)
 
-        # Random food spawning (no auto-despawn)
+        # Random food spawning (dynamic burst; no auto-despawn)
         if t_sec >= next_food_spawn_t:
-            maze.spawn_food_random()
+            available = maze.available_food()
+            target = int(FOOD_TARGET_PER_WORM * len(worms))
+            deficit = max(0, target - available)
+            nspawn = max(1, min(FOOD_SPAWN_BURST_MAX, deficit))
+            spawned = 0
+            for _ in range(nspawn):
+                if maze.spawn_food_random():
+                    spawned += 1
+            food_spawned_count += spawned
             next_food_spawn_t = _schedule_next_food_spawn(t_sec)
 
 
@@ -1132,45 +1206,49 @@ def run() -> None:
                 sliders = build_sliders(main_worm.params, main_worm, maze, start=(WIN_SIZE[0] - 260, 120))
                 slider_panel = ScrollableSliderPanel(slider_panel_rect, sliders)
 
-        # Reproduction: parents die after mating; offspring inherit fastest parent's DNA
+        # Reproduction: grid-accelerated neighbor checks; parents die after mating
         import random as _random
+        from .spatial import SpatialHash
         new_worms: List[Worm] = []
-        for i in range(len(worms)):
-            wi = worms[i]
+        # Build a spatial index over heads
+        grid = SpatialHash(cell_size=160.0)
+        for w in worms:
+            hx, hy = w.head_pos()
+            grid.insert(w, hx, hy)
+        visited: set[tuple[int, int]] = set()
+        for wi in list(worms):
             if not wi.alive:
                 continue
-            for j in range(i + 1, len(worms)):
-                wj = worms[j]
-                if not wj.alive:
+            hix, hiy = wi.head_pos()
+            # Query neighbors within a local radius
+            local_r = 2.0 * max(wi.body_radius, BASE_BODY_RADIUS) * REPRODUCTION_DISTANCE_SCALE + 8.0
+            for wj in grid.query_radius(hix, hiy, local_r):
+                if wj is wi or not getattr(wj, 'alive', True):
                     continue
-                # Heads distance threshold
-                hix, hiy = wi.head_pos()
+                key = (min(id(wi), id(wj)), max(id(wi), id(wj)))
+                if key in visited:
+                    continue
+                visited.add(key)
                 hjx, hjy = wj.head_pos()
                 d = math.hypot(hix - hjx, hiy - hjy)
                 thresh = REPRODUCTION_DISTANCE_SCALE * (wi.body_radius + wj.body_radius)
                 if d <= thresh and (wi.ready_to_mate or wj.ready_to_mate):
-                    # Choose fastest parent by EMA speed
                     donor = wi if getattr(wi, 'speed_ema', 0.0) >= getattr(wj, 'speed_ema', 0.0) else wj
                     import copy
                     child_params = copy.deepcopy(donor.params)
-                    # Number of offspring 0..5; all inherit same donor DNA
                     offspring_n = _random.randint(0, 5)
                     for _ in range(offspring_n):
-                        # Physical traits
                         num_segments = int(BASE_SEGMENTS * _random.uniform(0.6, 1.4))
                         body_radius = BASE_BODY_RADIUS * _random.uniform(0.6, 1.5)
                         seg_spacing = BASE_SEG_SPACING * _random.uniform(0.7, 1.3)
-                        # Placement jitter around parents' midpoint
                         cxp = (hix + hjx) * 0.5 + _random.uniform(-12.0, 12.0)
                         cyp = (hiy + hjy) * 0.5 + _random.uniform(-12.0, 12.0)
                         chead = _random.uniform(0, 2 * math.pi)
                         col = donor.color
                         new_worms.append(Worm(origin=(cxp, cyp), heading=chead, params=child_params, color=col,
                                               segments=num_segments, body_radius=body_radius, seg_spacing=seg_spacing))
-                    # Parents die after mating
                     wi.alive = False
                     wj.alive = False
-                    break
         if new_worms:
             births_count += len(new_worms)
             worms.extend(new_worms)
@@ -1186,12 +1264,48 @@ def run() -> None:
             cam[0] = max(0.0, min(WORLD_SIZE[0] - WIN_SIZE[0], hx - WIN_SIZE[0] * 0.5))
             cam[1] = max(0.0, min(WORLD_SIZE[1] - WIN_SIZE[1], hy - WIN_SIZE[1] * 0.5))
 
-        maze.draw(screen, (cam[0], cam[1]))
-        # Draw all worms (each with their own genetics affecting appearance)
-        for i, w in enumerate(worms):
-            # Only draw sensors for main worm in follow mode
-            draw_sensors = (i == 0 and not camera_overview)
-            w.draw(screen, (cam[0], cam[1]), draw_sensors=draw_sensors)
+        if use_gl:
+            glr.begin((cam[0], cam[1]))
+            # Obstacles as ellipses
+            obs_instances = []
+            for obs in maze.obstacles:
+                cx = obs.rect.centerx
+                cy = obs.rect.centery
+                rx = max(1.0, obs.rect.w * 0.5)
+                ry = max(1.0, obs.rect.h * 0.5)
+                obs_instances.append(CircleInstance(cx, cy, rx, ry, 34/255.0, 45/255.0, 78/255.0))
+            glr.draw_instances(obs_instances)
+            # Foods near viewport
+            vw, vh = WIN_SIZE
+            foods = list(maze.foods_near(cam[0] + vw * 0.5, cam[1] + vh * 0.5, max(vw, vh) * 0.8))
+            food_r = float(max(1, int(maze.food_radius)))
+            food_instances = [
+                CircleInstance(f.x, f.y, food_r, food_r, 90/255.0, 200/255.0, 110/255.0)
+                for f in foods if not f.eaten
+            ]
+            glr.draw_instances(food_instances)
+            # Worm segments
+            lite_mode = len(worms) >= 300
+            worm_instances = []
+            for i, w in enumerate(worms):
+                segs = list(reversed(w.segs))
+                step = 3 if lite_mode else 1
+                for s_idx in range(0, len(segs), step):
+                    seg = segs[s_idx]
+                    r = w.body_radius * (0.9 + 0.12 * math.sin(0.6 * s_idx))
+                    col = w.color if not getattr(w, 'ready_to_mate', False) else (255, 120, 180)
+                    worm_instances.append(CircleInstance(float(seg.pos[0]), float(seg.pos[1]), r, r, col[0]/255.0, col[1]/255.0, col[2]/255.0))
+            glr.draw_instances(worm_instances)
+            glr.end()
+        else:
+            maze.draw(screen, (cam[0], cam[1]))
+            # Draw all worms (each with their own genetics affecting appearance)
+            for i, w in enumerate(worms):
+                # Only draw sensors for main worm in follow mode
+                draw_sensors = (i == 0 and not camera_overview)
+                draw_dna = (i == 0 and not camera_overview) or (len(worms) <= 100)
+                lite_mode = len(worms) >= 300
+                w.draw(screen, (cam[0], cam[1]), draw_sensors=draw_sensors, draw_dna=draw_dna, lite_mode=lite_mode)
 
         # Top status bar (avoids minimap area)
         mini_w = 240
@@ -1202,60 +1316,83 @@ def run() -> None:
         bar_w = max(100, (mini_rect.x - 12) - bar_x)
         bar_h = 48 if show_ui else 66
         bar_rect = pg.Rect(bar_x, bar_y, bar_w, bar_h)
-        # Background
-        pg.draw.rect(screen, (16, 22, 36), bar_rect, border_radius=10)
-        pg.draw.rect(screen, (40, 56, 92), bar_rect, width=1, border_radius=10)
+        if not use_gl:
+            # Background
+            pg.draw.rect(screen, (16, 22, 36), bar_rect, border_radius=10)
+            pg.draw.rect(screen, (40, 56, 92), bar_rect, width=1, border_radius=10)
         # Compose metrics
         total_food = len(maze.foods)
-        available_food = sum(1 for f in maze.foods if not f.eaten)
+        available_food = maze.available_food()
         eaten_food = total_food - available_food
         ratio = (available_food / total_food) if total_food > 0 else 0.0
         ready = sum(1 for w in worms if getattr(w, 'ready_to_mate', False))
         avg_spd = (sum(getattr(w, 'speed_ema', 0.0) for w in worms) / len(worms)) if worms else 0.0
         max_spd = max((getattr(w, 'speed_ema', 0.0) for w in worms), default=0.0)
+        # Append time-series stats (sample at ~2 Hz)
+        if 'last_stats_t' not in locals():
+            last_stats_t = -1.0
+        try:
+            last_stats_t
+        except NameError:
+            last_stats_t = -1.0
+        if t_sec - (globals().get('_last_stats_t', -1.0)) >= 0.5:
+            stats_log['t'].append(float(t_sec))
+            stats_log['pop'].append(int(len(worms)))
+            stats_log['ready'].append(int(ready))
+            stats_log['births'].append(int(births_count))
+            stats_log['deaths'].append(int(deaths_count))
+            stats_log['food_avail'].append(int(available_food))
+            stats_log['food_total'].append(int(total_food))
+            stats_log['food_ratio'].append(float(ratio))
+            stats_log['avg_spd'].append(float(avg_spd))
+            stats_log['max_spd'].append(float(max_spd))
+            globals()['_last_stats_t'] = t_sec
         # Next food spawn countdown
         spawn_in = max(0, int(next_food_spawn_t - t_sec))
-        # Row 1
-        x = bar_x + 10
-        y = bar_y + 6
-        for txt in [
-            f"Pop {len(worms)}",
-            f"Ready {ready}",
-            f"Births {births_count}",
-            f"Deaths {deaths_count}",
-            f"Food {available_food}/{total_food} ({ratio:.0%})",
-        ]:
-            img = font.render(txt, True, (220, 230, 245))
-            screen.blit(img, (x, y))
-            x += img.get_width() + 18
+        if not use_gl:
+            # Row 1
+            x = bar_x + 10
+            y = bar_y + 6
+            for txt in [
+                f"Pop {len(worms)}",
+                f"Ready {ready}",
+                f"Births {births_count}",
+                f"Deaths {deaths_count}",
+                f"Food {available_food}/{total_food} ({ratio:.0%})",
+            ]:
+                img = font.render(txt, True, (220, 230, 245))
+                screen.blit(img, (x, y))
+                x += img.get_width() + 18
         # Row 2
-        x = bar_x + 10
-        y = bar_y + 6 + 18
-        mm = int(t_sec) // 60
-        ss = int(t_sec) % 60
-        for txt in [
-            f"Time {mm:02d}:{ss:02d}",
-            f"AvgSpd {avg_spd:.0f}",
-            f"MaxSpd {max_spd:.0f}",
-            f"NextFood {spawn_in}s",
-        ]:
-            img = font.render(txt, True, (200, 215, 235))
-            screen.blit(img, (x, y))
-            x += img.get_width() + 18
+        if not use_gl:
+            x = bar_x + 10
+            y = bar_y + 6 + 18
+            mm = int(t_sec) // 60
+            ss = int(t_sec) % 60
+            for txt in [
+                f"Time {mm:02d}:{ss:02d}",
+                f"AvgSpd {avg_spd:.0f}",
+                f"MaxSpd {max_spd:.0f}",
+                f"NextFood {spawn_in}s",
+            ]:
+                img = font.render(txt, True, (200, 215, 235))
+                screen.blit(img, (x, y))
+                x += img.get_width() + 18
         # Row 3: hint when UI hidden
-        if not show_ui:
+        if not use_gl and not show_ui:
             hint_txt = "H: show UI   C: reload   V: view"
             img = font.render(hint_txt, True, (185, 195, 215))
             screen.blit(img, (bar_x + 10, bar_y + 6 + 36))
         
-        # Minimap (top-right), shows world overview, obstacles, foods, all worms, viewport
-        mini_w = 240
-        mini_h = int(240 * (WORLD_SIZE[1] / WORLD_SIZE[0]))
-        mini_rect = pg.Rect(WIN_SIZE[0] - mini_w - 12, 12, mini_w, mini_h)
-        cam_rect = pg.Rect(int(cam[0]), int(cam[1]), WIN_SIZE[0], WIN_SIZE[1])
-        maze.draw_minimap(screen, mini_rect, [w.head_pos() for w in worms], cam_rect)
+        # Minimap (top-right) only in CPU renderer
+        if not use_gl:
+            mini_w = 240
+            mini_h = int(240 * (WORLD_SIZE[1] / WORLD_SIZE[0]))
+            mini_rect = pg.Rect(WIN_SIZE[0] - mini_w - 12, 12, mini_w, mini_h)
+            cam_rect = pg.Rect(int(cam[0]), int(cam[1]), WIN_SIZE[0], WIN_SIZE[1])
+            maze.draw_minimap(screen, mini_rect, [w.head_pos() for w in worms], cam_rect)
         # HUD panel and hints
-        if show_ui:
+        if not use_gl and show_ui:
             panel = pg.Rect(WIN_SIZE[0] - 280, 20, 260, WIN_SIZE[1] - 40)
             # More rounded panel corners
             pg.draw.rect(screen, (16, 20, 36), panel, border_radius=20)
@@ -1280,7 +1417,95 @@ def run() -> None:
 
         pg.display.flip()
 
+    # Final statistics overlay (CPU renderer only)
+    if not use_gl:
+        try:
+            screen.fill((10, 14, 26))
+            panel = pg.Rect(WIN_SIZE[0]//2 - 360, WIN_SIZE[1]//2 - 160, 720, 320)
+            pg.draw.rect(screen, (18, 24, 40), panel, border_radius=18)
+            pg.draw.rect(screen, (60, 80, 130), panel, width=2, border_radius=18)
+            title = big_font.render("Simulation Summary", True, (230, 240, 255))
+            screen.blit(title, (panel.x + 20, panel.y + 16))
+            # Compute metrics
+            total_time = t_sec
+            mm = int(total_time) // 60
+            ss = int(total_time) % 60
+            final_pop = len(worms)
+            available_end = sum(1 for f in maze.foods if not f.eaten)
+            total_spawned = food_spawned_count
+            initial_total = initial_food_total
+            eaten_total = max(0, initial_total + total_spawned - available_end)
+            lines = [
+                f"Time: {mm:02d}:{ss:02d}",
+                f"Final population: {final_pop}",
+                f"Births: {births_count}    Deaths: {deaths_count}",
+                f"Food: spawned {total_spawned}, eaten {eaten_total}, remaining {available_end}",
+            ]
+            y = panel.y + 60
+            for txt in lines:
+                img = font.render(txt, True, (210, 220, 235))
+                screen.blit(img, (panel.x + 20, y))
+                y += 26
+            hint = font.render("Press any key or wait 5s to exit", True, (185, 195, 210))
+            screen.blit(hint, (panel.x + 20, panel.y + panel.h - 36))
+            pg.display.flip()
+            # Wait for short period or input
+            wait_ms = 5000
+            end_wait = pg.time.get_ticks() + wait_ms
+            waiting = True
+            while waiting:
+                for ev in pg.event.get():
+                    if ev.type in (pg.QUIT, pg.KEYDOWN, pg.MOUSEBUTTONDOWN):
+                        waiting = False
+                        break
+                if pg.time.get_ticks() >= end_wait:
+                    waiting = False
+                pg.time.delay(20)
+        except Exception:
+            pass
+
     pg.quit()
+
+    # Persist time-series stats to /stats
+    try:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(stats_dir, f"stats_{run_id}.csv")
+        with open(csv_path, "w", newline="") as fcsv:
+            writer = csv.writer(fcsv)
+            headers = list(stats_log.keys())
+            writer.writerow(headers)
+            rows = zip(*(stats_log[k] for k in headers))
+            for row in rows:
+                writer.writerow(row)
+        try:
+            import matplotlib.pyplot as plt
+            series = [
+                ("pop", "Population"),
+                ("ready", "Ready to mate"),
+                ("births", "Births (cumulative)"),
+                ("deaths", "Deaths (cumulative)"),
+                ("food_avail", "Food available"),
+                ("food_total", "Food total"),
+                ("food_ratio", "Food availability ratio"),
+                ("avg_spd", "Average speed"),
+                ("max_spd", "Max speed"),
+            ]
+            t = stats_log["t"]
+            for key, title in series:
+                plt.figure(figsize=(8, 3))
+                plt.plot(t, stats_log[key], lw=1.6)
+                plt.title(title)
+                plt.xlabel("Time (s)")
+                plt.ylabel(title)
+                plt.grid(True, alpha=0.3)
+                out_png = os.path.join(stats_dir, f"{key}_{run_id}.png")
+                plt.tight_layout()
+                plt.savefig(out_png)
+                plt.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
