@@ -1,0 +1,75 @@
+{
+  "sections": [
+    {
+      "title": "Muscles",
+      "items": [
+        { "label": "Muscle baseline", "min": 0.0, "max": 0.3, "paths": ["params.muscle_baseline"], "type": "float", "fmt": "{:.2f}", "post": "apply_muscle_params" },
+        { "label": "Muscle gain", "min": 0.5, "max": 4.0, "paths": ["params.muscle_gain"], "type": "float", "fmt": "{:.2f}", "post": "apply_muscle_params" },
+        { "label": "Muscle gamma", "min": 0.4, "max": 3.0, "paths": ["params.muscle_gamma"], "type": "float", "fmt": "{:.2f}", "post": "apply_muscle_params" }
+      ]
+    },
+    {
+      "title": "Body",
+      "items": [
+        { "label": "Joint flex", "min": 0.2, "max": 3.0, "paths": ["params.joint_flex"], "type": "float", "fmt": "{:.2f}" }
+      ]
+    },
+    {
+      "title": "Food",
+      "items": [
+        { "label": "Foods per cell", "min": 0.0, "max": 8.0, "paths": ["maze.foods_per_cell"], "type": "int", "fmt": "{:.0f}", "post": "regenerate_maze" },
+        { "label": "Food spawn prob", "min": 0.0, "max": 1.0, "paths": ["maze.food_prob"], "type": "float", "fmt": "{:.2f}", "post": "regenerate_maze" },
+        { "label": "Food radius", "min": 1.0, "max": 8.0, "paths": ["maze.food_radius"], "type": "int", "fmt": "{:.0f}" }
+      ]
+    },
+    {
+      "title": "Brain",
+      "items": [
+        { "label": "Brain gain", "min": 0.0, "max": 3.0, "paths": ["params.brain_gain"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Brain interval", "min": 60.0, "max": 500.0, "paths": ["params.brain_interval_ms", "worm.brain.interval_ms"], "type": "int", "fmt": "{:.0f}" },
+        { "label": "Brain twitch gain", "min": 0.1, "max": 3.0, "paths": ["params.brain_twitch_gain"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Stuck timeout (s)", "min": 2.0, "max": 20.0, "paths": ["params.brain_stuck_timeout_s"], "type": "float", "fmt": "{:.1f}" },
+        { "label": "Stuck min improve (px)", "min": 4.0, "max": 200.0, "paths": ["params.brain_stuck_min_improve_px"], "type": "float", "fmt": "{:.0f}" },
+        { "label": "Target cooldown (s)", "min": 2.0, "max": 60.0, "paths": ["params.brain_target_cooldown_s"], "type": "float", "fmt": "{:.1f}" }
+      ]
+    },
+    {
+      "title": "Attractors",
+      "items": [
+        { "label": "Attract gain", "min": 0.0, "max": 3.0, "paths": ["params.attract_gain"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Food range", "min": 60.0, "max": 800.0, "paths": ["params.food_range"], "type": "float", "fmt": "{:.0f}" }
+      ]
+    },
+    {
+      "title": "Motion",
+      "items": [
+        { "label": "Wave Freq (Hz)", "min": 0.2, "max": 3.0, "paths": ["params.wave_freq"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Wave Amp", "min": 0.0, "max": 1.0, "paths": ["params.wave_amp"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Forward Gain", "min": 5.0, "max": 80.0, "paths": ["params.forward_gain"], "type": "float", "fmt": "{:.2f}" }
+      ]
+    },
+    {
+      "title": "Sensors",
+      "items": [
+        { "label": "Steer Gain", "min": 0.0, "max": 3.0, "paths": ["params.steer_gain"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Sensor FOV (deg)", "min": 5.0, "max": 90.0, "paths": ["params.sensor_fov_deg"], "type": "float", "fmt": "{:.0f}" },
+        { "label": "Sensor Range", "min": 40.0, "max": 260.0, "paths": ["params.sensor_range"], "type": "float", "fmt": "{:.0f}" },
+        { "label": "Avoid Dist", "min": 10.0, "max": 220.0, "paths": ["params.avoidance_threshold"], "type": "float", "fmt": "{:.0f}" },
+        { "label": "Antenna end window", "min": 5.0, "max": 120.0, "paths": ["params.sensor_end_contact_px"], "type": "float", "fmt": "{:.0f}" },
+        { "label": "Sensor fan rays", "min": 3.0, "max": 17.0, "paths": ["params.sensor_fan_rays"], "type": "int", "fmt": "{:.0f}" },
+        { "label": "Avoid turn gain", "min": 0.5, "max": 6.0, "paths": ["params.avoid_turn_gain"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Avoid slow gain", "min": 0.0, "max": 3.0, "paths": ["params.avoid_slow_gain"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Min forward frac", "min": 0.0, "max": 0.6, "paths": ["params.min_forward_frac"], "type": "float", "fmt": "{:.2f}" }
+      ]
+    },
+    {
+      "title": "Neurons",
+      "items": [
+        { "label": "Head k", "min": 0.4, "max": 3.0, "paths": ["params.k_gain_head", "worm.head_neuron_L.k_gain", "worm.head_neuron_R.k_gain"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "Head interval", "min": 80.0, "max": 800.0, "paths": ["params.head_interval_ms", "worm.head_neuron_L.interval_ms", "worm.head_neuron_R.interval_ms"], "type": "int", "fmt": "{:.0f}" },
+        { "label": "BG k", "min": 0.4, "max": 3.0, "paths": ["params.k_gain_bg", "worm.bg_neuron.k_gain"], "type": "float", "fmt": "{:.2f}" },
+        { "label": "BG interval", "min": 80.0, "max": 1200.0, "paths": ["params.bg_interval_ms", "worm.bg_neuron.interval_ms"], "type": "int", "fmt": "{:.0f}" }
+      ]
+    }
+  ]
+}

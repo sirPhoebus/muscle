@@ -1,0 +1,192 @@
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { View, Text, StyleSheet, SafeAreaView, Pressable } from "react-native";
+import { Canvas, useFrame } from '@react-three/fiber';
+import { OrbitControls } from '@react-three/drei';
+import * as THREE from 'three';
+
+// ---- Helpers (shared with 2D sim concepts) ----
+const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
+const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
+const randn = () => { let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random(); return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v); };
+const computeDecayDuration = (base: number) => Math.max(120, 520 * clamp01(base || 0));
+const computeTwitchTiming = (a: number) => { const amp = clamp01(a || 0); const rise = Math.max(30, Math.floor(90 * amp)); return { rise, hold: 20, decay: computeDecayDuration(amp) }; };
+const mapActivation = (a: number, baseline: number, gain: number, gamma: number) => {
+  const A = clamp01(a); const b = clamp01(baseline); const g = Math.max(0, gain); const gm = Math.max(0.1, gamma);
+  const curved = Math.pow(A, gm); const towardMax = Math.min(1, curved * g); return clamp01(b + (1 - b) * towardMax);
+};
+
+// ---- Parameter defaults ----
+const SEGMENTS = 16;
+const BANDS = 6;
+const FIBERS_COUNT = SEGMENTS * BANDS;
+
+class FiberState {
+  value = 0; target = 0; phase = 0;
+  seq?: { t: number; stage: 'rise'|'hold'|'decay'; end: number; peak: number; rise: number; hold: number; decay: number };
+  constructor(public seg: number, public band: number) {}
+}
+
+function useWormLogic() {
+  const [intervalSec, setIntervalSec] = useState(1.0);
+  const [neuronEnabled, setNeuronEnabled] = useState(true);
+  const [gain, setGain] = useState(2.0);
+  const [baseline, setBaseline] = useState(0.05);
+  const [gamma, setGamma] = useState(0.8);
+  const [compression, setCompression] = useState(1.0);
+  const [minLenRatio, setMinLenRatio] = useState(0.5);
+  const [kGain, setKGain] = useState(1.3);
+  const [waveSpeed, setWaveSpeed] = useState(2.0);
+  const [waveAmp, setWaveAmp] = useState(0.35);
+
+  const fibers = useRef<FiberState[]>([]);
+  if (fibers.current.length !== FIBERS_COUNT) {
+    fibers.current = Array.from({ length: FIBERS_COUNT }, (_, idx) => {
+      const seg = Math.floor(idx / BANDS); const band = idx % BANDS; const f = new FiberState(seg, band);
+      f.phase = seg * 0.35 + band * (Math.PI * 2 / BANDS) * 0.1; return f;
+    });
+  }
+
+  const tickNeurons = useCallback(() => {
+    if (!neuronEnabled) return; const k = kGain;
+    for (const f of fibers.current) {
+      const out = sigmoid(k * randn()); const { rise, hold, decay } = computeTwitchTiming(out);
+      const now = performance.now(); f.seq = { t: now, stage: 'rise', end: now + rise, peak: out, rise, hold, decay }; f.target = out;
+    }
+  }, [neuronEnabled, kGain]);
+
+  useEffect(() => { if (!neuronEnabled) return; const ms = Math.max(120, Math.floor(intervalSec * 1000)); const id = setInterval(tickNeurons, ms); return () => clearInterval(id); }, [neuronEnabled, intervalSec, tickNeurons]);
+
+  const timeRef = useRef(0);
+  const step = useCallback((dt: number) => {
+    timeRef.current += dt; const t = timeRef.current;
+    for (const f of fibers.current) {
+      const wave = 0.5 + 0.5 * Math.sin((t * waveSpeed * Math.PI * 2) + f.phase);
+      if (f.seq) {
+        const now = performance.now();
+        if (f.seq.stage === 'rise') { const u = clamp01((now - f.seq.t) / (f.seq.rise || 1)); f.value = THREE.MathUtils.lerp(f.value, f.seq.peak, u); if (now >= f.seq.end) { f.seq.stage = 'hold'; f.seq.t = now; f.seq.end = now + f.seq.hold; } }
+        else if (f.seq.stage === 'hold') { f.value = f.seq.peak; if (now >= f.seq.end) { f.seq.stage = 'decay'; f.seq.t = now; f.seq.end = now + f.seq.decay; } }
+        else if (f.seq.stage === 'decay') { const u = clamp01((now - f.seq.t) / (f.seq.decay || 1)); f.value = THREE.MathUtils.lerp(f.seq.peak, 0, u); if (now >= f.seq.end) { f.seq = undefined; f.value = 0; } }
+      } else { f.value *= 0.98; }
+      const combined = clamp01(waveAmp * wave + (1 - waveAmp) * f.value);
+      f.target = mapActivation(combined, baseline, gain, gamma);
+    }
+  }, [waveSpeed, waveAmp, baseline, gain, gamma]);
+
+  return { fibers, step, params: { intervalSec, setIntervalSec, neuronEnabled, setNeuronEnabled, gain, setGain, baseline, setBaseline, gamma, setGamma, compression, setCompression, minLenRatio, setMinLenRatio, kGain, setKGain, waveSpeed, setWaveSpeed, waveAmp, setWaveAmp } };
+}
+
+function WormBody({ logic }: { logic: ReturnType<typeof useWormLogic> }) {
+  const group = useRef<THREE.Group>(null!);
+  const segLen = 0.22; const bodyRadius = 0.18; const innerRadius = 0.12;
+  const shellMat = useMemo(() => new THREE.MeshStandardMaterial({ color: '#7dd3fc', roughness: 0.4, metalness: 0.1, transparent: true, opacity: 0.35 }), []);
+  const muscleMat = useMemo(() => new THREE.MeshStandardMaterial({ color: '#ef4444', roughness: 0.6, metalness: 0.0 }), []);
+  const shells = useRef<THREE.Mesh[]>([]); const muscles = useRef<THREE.Mesh[]>([]);
+  const builtRef = useRef(false);
+  useEffect(() => {
+    if (builtRef.current) return; builtRef.current = true;
+    const gShell = new THREE.CylinderGeometry(bodyRadius, bodyRadius, segLen, 16, 1, true);
+    const gMuscle = new THREE.CylinderGeometry(innerRadius, innerRadius, segLen * 0.96, 8, 1, true);
+    for (let s = 0; s < SEGMENTS; s++) { const m = new THREE.Mesh(gShell, shellMat); m.castShadow = true; m.receiveShadow = true; m.rotation.x = Math.PI / 2; group.current.add(m); shells.current.push(m); }
+    for (let s = 0; s < SEGMENTS; s++) { for (let b = 0; b < BANDS; b++) { const mm = new THREE.Mesh(gMuscle, muscleMat); mm.castShadow = true; mm.receiveShadow = true; mm.rotation.x = Math.PI / 2; group.current.add(mm); muscles.current.push(mm); } }
+  }, [shellMat, muscleMat]);
+
+  useFrame((state, delta) => {
+    logic.step(delta); const { fibers } = logic; const compression = logic.params.compression; const minLenRatio = logic.params.minLenRatio;
+    for (let s = 0; s < SEGMENTS; s++) {
+      const segOffsetZ = (s - SEGMENTS / 2) * (segLen * 1.02);
+      let avg = 0; for (let b = 0; b < BANDS; b++) avg += fibers.current[s * BANDS + b].target; avg /= BANDS;
+      const axial = THREE.MathUtils.lerp(1, Math.max(minLenRatio, 0.4), avg * compression);
+      const radial = THREE.MathUtils.lerp(1, 1 + 0.35 * avg * compression, 1);
+      const shell = shells.current[s]; if (shell) { shell.position.set(0, 0, segOffsetZ); shell.scale.set(radial, axial, radial); }
+      for (let b = 0; b < BANDS; b++) {
+        const fiberIdx = s * BANDS + b; const f = fibers.current[fiberIdx]; const mm = muscles.current[fiberIdx]; if (!mm) continue;
+        const theta = (b / BANDS) * Math.PI * 2; const r = innerRadius * 0.9; const x = r * Math.cos(theta); const y = r * Math.sin(theta);
+        mm.position.set(x, y, segOffsetZ); const lenScale = THREE.MathUtils.lerp(1, Math.max(minLenRatio, 0.4), f.target * compression); mm.scale.set(1, lenScale, 1);
+      }
+    }
+    const headAvg = (() => { let a = 0; for (let b = 0; b < BANDS; b++) a += logic.fibers.current[b].target; return a / BANDS; })();
+    group.current.position.z += (headAvg - 0.5) * 0.002; group.current.rotation.y = Math.sin(state.clock.elapsedTime * 0.5) * 0.1;
+  });
+
+  return (<group ref={group} position={[0, 0, 0]} />);
+}
+
+export default function Worm3D() {
+  const logic = useWormLogic();
+  return (
+    <SafeAreaView style={styles.safe}>
+      <View style={styles.header}><Text style={styles.title}>Worm 3D ~96 fibers (6×16) with peristalsis</Text></View>
+      <View style={styles.controls}>
+        <View style={styles.row}><Text style={styles.section}>Neurons</Text></View>
+        <View style={styles.row}>
+          <Text style={styles.label}>Auto-fire</Text>
+          <Pressable onPress={() => logic.params.setNeuronEnabled(!logic.params.neuronEnabled)} style={[styles.button, logic.params.neuronEnabled ? styles.btnOn : styles.btnOff]}>
+            <Text style={styles.buttonText}>{logic.params.neuronEnabled ? 'Stop' : 'Start'}</Text>
+          </Pressable>
+        </View>
+        <View style={styles.row}>
+          <Text style={styles.label}>Interval</Text>
+          <Stepper value={logic.params.intervalSec} dec={() => logic.params.setIntervalSec(Math.max(0.1, parseFloat((logic.params.intervalSec - 0.1).toFixed(1))))} inc={() => logic.params.setIntervalSec(Math.min(5, parseFloat((logic.params.intervalSec + 0.1).toFixed(1))))} fmt={(v)=>v.toFixed(1)+'s'} />
+        </View>
+
+        <View style={styles.row}><Text style={styles.section}>Movement Mapping</Text></View>
+        <View style={styles.row}><Text style={styles.label}>Activation gain</Text><Stepper value={logic.params.gain} dec={()=>logic.params.setGain(Math.max(0.2, parseFloat((logic.params.gain-0.1).toFixed(1))))} inc={()=>logic.params.setGain(Math.min(3, parseFloat((logic.params.gain+0.1).toFixed(1))))} fmt={(v)=>v.toFixed(1)+'×'}/></View>
+        <View style={styles.row}><Text style={styles.label}>Baseline (Point B)</Text><Stepper value={logic.params.baseline} dec={()=>logic.params.setBaseline(Math.max(0, parseFloat((logic.params.baseline-0.05).toFixed(2))))} inc={()=>logic.params.setBaseline(Math.min(0.9, parseFloat((logic.params.baseline+0.05).toFixed(2))))} fmt={(v)=>Math.round(v*100)+'%'}/></View>
+        <View style={styles.row}><Text style={styles.label}>Curve (γ)</Text><Stepper value={logic.params.gamma} dec={()=>logic.params.setGamma(Math.max(0.5, parseFloat((logic.params.gamma-0.1).toFixed(1))))} inc={()=>logic.params.setGamma(Math.min(3, parseFloat((logic.params.gamma+0.1).toFixed(1))))} fmt={(v)=>v.toFixed(1)}/></View>
+        <View style={styles.row}><Text style={styles.label}>Max compression (span)</Text><Stepper value={logic.params.compression} dec={()=>logic.params.setCompression(Math.max(0.1, parseFloat((logic.params.compression-0.05).toFixed(2))))} inc={()=>logic.params.setCompression(Math.min(1, parseFloat((logic.params.compression+0.05).toFixed(2))))} fmt={(v)=>Math.round(v*100)+'%'}/></View>
+        <View style={styles.row}><Text style={styles.label}>Min length</Text><Stepper value={logic.params.minLenRatio} dec={()=>logic.params.setMinLenRatio(Math.max(0.2, parseFloat((logic.params.minLenRatio-0.05).toFixed(2))))} inc={()=>logic.params.setMinLenRatio(Math.min(0.9, parseFloat((logic.params.minLenRatio+0.05).toFixed(2))))} fmt={(v)=>Math.round(v*100)+'%'}/></View>
+
+        <View style={styles.row}><Text style={styles.section}>Wave</Text></View>
+        <View style={styles.row}><Text style={styles.label}>Wave speed</Text><Stepper value={logic.params.waveSpeed} dec={()=>logic.params.setWaveSpeed(Math.max(0.2, parseFloat((logic.params.waveSpeed-0.1).toFixed(1))))} inc={()=>logic.params.setWaveSpeed(Math.min(5, parseFloat((logic.params.waveSpeed+0.1).toFixed(1))))} fmt={(v)=>v.toFixed(1)+' Hz'}/></View>
+        <View style={styles.row}><Text style={styles.label}>Wave mix</Text><Stepper value={logic.params.waveAmp} dec={()=>logic.params.setWaveAmp(Math.max(0, parseFloat((logic.params.waveAmp-0.05).toFixed(2))))} inc={()=>logic.params.setWaveAmp(Math.min(1, parseFloat((logic.params.waveAmp+0.05).toFixed(2))))} fmt={(v)=>Math.round(v*100)+'%'}/></View>
+        <View style={styles.row}><Text style={styles.label}>Neuron noise gain (k)</Text><Stepper value={logic.params.kGain} dec={()=>logic.params.setKGain(Math.max(0.5, parseFloat((logic.params.kGain-0.1).toFixed(1))))} inc={()=>logic.params.setKGain(Math.min(3, parseFloat((logic.params.kGain+0.1).toFixed(1))))} fmt={(v)=>v.toFixed(1)}/></View>
+      </View>
+
+      <View style={styles.canvasWrap}>
+        <Canvas camera={{ position: [2.2, 2.2, 3.6], fov: 45 }}>
+          <ambientLight intensity={0.5} />
+          <directionalLight position={[3, 4, 2]} intensity={0.9} castShadow />
+          <group position={[0, -0.1, 0]}>
+            <WormBody logic={logic} />
+            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.6, 0]} receiveShadow>
+              <planeGeometry args={[10, 10]} />
+              <meshStandardMaterial color="#0b1225" />
+            </mesh>
+          </group>
+          <OrbitControls makeDefault enableDamping dampingFactor={0.1} enableZoom enableRotate enablePan />
+        </Canvas>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function Stepper({ value, dec, inc, fmt }: { value: number, dec: () => void, inc: () => void, fmt: (v: number) => string }) {
+  return (
+    <View style={styles.stepper}>
+      <Pressable onPress={dec} style={styles.stepBtn}><Text style={styles.stepText}>-</Text></Pressable>
+      <Text style={styles.intervalText}>{fmt(value)}</Text>
+      <Pressable onPress={inc} style={styles.stepBtn}><Text style={styles.stepText}>+</Text></Pressable>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: '#0b1020' },
+  header: { paddingHorizontal: 14, paddingTop: 14, paddingBottom: 6 },
+  title: { fontSize: 18, color: '#e5e7eb', fontWeight: '700' },
+  controls: { paddingHorizontal: 14, gap: 6 },
+  section: { color: '#94a3b8', fontWeight: '700' },
+  row: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  label: { color: '#cbd5e1', fontSize: 13 },
+  button: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1 },
+  btnOn: { backgroundColor: '#0f2a1b', borderColor: '#14532d' },
+  btnOff: { backgroundColor: '#1f2937', borderColor: '#334155' },
+  buttonText: { color: '#e5e7eb', fontWeight: '600' },
+  stepper: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  stepBtn: { width: 28, height: 28, borderRadius: 8, backgroundColor: '#111827', alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#374151' },
+  stepText: { color: '#e5e7eb', fontSize: 16, fontWeight: '700' },
+  intervalText: { color: '#e5e7eb', width: 100, textAlign: 'center', fontVariant: ['tabular-nums'], fontSize: 13 },
+  canvasWrap: { flex: 1, marginTop: 10 },
+});
+
+

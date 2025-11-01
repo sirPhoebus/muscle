@@ -1,0 +1,62 @@
+=== GENETICS VERIFICATION ===
+Worm 0:
+  wave_freq=2.669, forward_gain=59.4
+  wave_amp=0.619, joint_flex=0.537
+  segments=14, radius=6.9, spacing=11.5
+  steer_gain=0.681, sensor_range=205.7
+
+Worm 1:
+  wave_freq=0.667, forward_gain=52.3
+  wave_amp=0.935, joint_flex=0.497
+  segments=18, radius=10.0, spacing=20.2
+  steer_gain=0.658, sensor_range=243.1
+
+Worm 2:
+  wave_freq=1.169, forward_gain=19.2
+  wave_amp=0.497, joint_flex=0.816
+  segments=18, radius=7.6, spacing=12.4
+  steer_gain=0.867, sensor_range=201.2
+
+Worm 3:
+  wave_freq=0.979, forward_gain=41.9
+  wave_amp=0.727, joint_flex=1.249
+  segments=24, radius=14.0, spacing=15.2
+  steer_gain=2.864, sensor_range=98.5
+
+Worm 4:
+  wave_freq=2.806, forward_gain=31.7
+  wave_amp=0.862, joint_flex=1.102
+  segments=19, radius=6.3, spacing=13.9
+  steer_gain=1.335, sensor_range=221.6
+
+Worm 5:
+  wave_freq=0.898, forward_gain=34.9
+  wave_amp=0.403, joint_flex=1.450
+  segments=20, radius=11.9, spacing=14.7
+  steer_gain=2.979, sensor_range=74.6
+
+Worm 6:
+  wave_freq=2.002, forward_gain=52.7
+  wave_amp=0.270, joint_flex=1.372
+  segments=21, radius=7.0, spacing=20.7
+  steer_gain=1.974, sensor_range=76.0
+
+Worm 7:
+  wave_freq=2.815, forward_gain=26.4
+  wave_amp=0.619, joint_flex=1.511
+  segments=20, radius=8.8, spacing=19.8
+  steer_gain=2.748, sensor_range=207.1
+
+Worm 8:
+  wave_freq=0.306, forward_gain=39.3
+  wave_amp=0.774, joint_flex=0.755
+  segments=13, radius=11.5, spacing=19.9
+  steer_gain=1.617, sensor_range=223.5
+
+Worm 9:
+  wave_freq=0.324, forward_gain=18.3
+  wave_amp=0.938, joint_flex=0.602
+  segments=13, radius=9.4, spacing=13.7
+  steer_gain=2.186, sensor_range=136.1
+
+=============================
