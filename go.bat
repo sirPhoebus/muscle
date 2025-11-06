@@ -1,0 +1,1 @@
+call python -m pygame_worm.main --gl

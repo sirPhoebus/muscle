@@ -1,21 +1,9 @@
-Pygame Worm — Neuron + Muscle Fibers
+﻿Pygame Worm — Neuron + Muscle Fibers
 
 Overview
-- Reproduces the essentials from the `muscle-fiber` PoC: neurons triggering twitches that drive muscle fibers with a rise/hold/decay envelope mapped to contraction.
-- Simulates a segmented worm in Pygame with left/right longitudinal muscle bands per segment.
-- Adds two sensory neurons/rays on the head that detect obstacles (maze walls) and steer the worm left/right to avoid collisions.
-
-What you get
-- `Neuron` produces stochastic twitch amplitudes via `sigmoid(k * N(0,1))`.
-- `Twitch` envelope: rise → hold → decay.
-- `MuscleFiber` maps twitch activation to a contraction value.
-- `Worm` with segments and two fiber bands (left/right) per segment; undulatory gait with steering bias from sensors.
-- `Maze` with simple rectangular obstacles.
-
-Requirements
-- Python 3.9+
-- Pygame 2.x
-- NumPy
+- Segmented worm simulation with neuron-triggered muscle twitches and undulatory gait.
+- Sensors and an optional brain guide movement to avoid obstacles and collect food.
+- Supports large populations with CPU optimizations and an optional GPU renderer (ModernGL).
 
 Install
 ```bash
@@ -26,19 +14,38 @@ pip install -r pygame_worm/requirements.txt
 
 Run
 ```bash
-# Preferred
+# CPU (default)
 python -m pygame_worm.main
 
-# Or (fallback):
-python pygame_worm/main.py
+# GPU rendering (ModernGL)
+python -m pygame_worm.main --gl
+# or
+GL=1 python -m pygame_worm.main
 ```
 
 Controls
-- `R`: regenerate maze
-- `SPACE`: toggle pause
-- `ESC`/window close: quit
-- Click the `Neurons` button (top of panel) to toggle automatic neuron firing on/off.
+- R: regenerate maze
+- SPACE: toggle pause
+- ESC / close window: quit
+- Click “Neurons (Main Worm)” (UI panel) to toggle neural drive.
 
-Notes
-- Rendering is 2.5D (top-down) for simplicity within Pygame. The muscle model and control logic reflect the neuron→fiber twitch concepts from the TS PoC.
-- Key parameters (segment count, frequencies, gains) are at the top of `main.py`.
+Stats & Dashboard
+- On exit, a CSV is written to `./stats/stats_<timestamp>.csv`.
+- Generate an HTML dashboard for the latest CSV:
+```bash
+python tools/make_dashboard.py
+# Output: stats/dashboard_latest.html
+```
+(The dashboard uses Chart.js via CDN; no extra Python deps.)
+
+Project Structure
+- `config.py` — constants and DNA color palette
+- `params.py` — genetic parameters + `create_random_genetics()`
+- `worm.py` — worm entity (update/draw), muscles, sensors, brain
+- `maze.py` — world, obstacles, foods, drawing, spatial queries
+- `spatial.py` — 2D spatial hash for proximity queries
+- `ui.py` — sliders panel and button
+- `gl_renderer.py` — GPU instanced renderer (ModernGL)
+- `app.py` — orchestration (loop, camera, spawn, stats)
+- `main.py` — thin entry wrapper
+- `tools/make_dashboard.py` — build HTML dashboard from latest stats CSV

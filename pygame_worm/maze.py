@@ -271,7 +271,7 @@ class Maze:
             if 0 <= sx < vw and 0 <= sy < vh:
                 pg.draw.circle(surf, (90, 200, 110), (sx, sy), max(1, int(self.food_radius)))
 
-    def draw_minimap(self, surf: pg.Surface, dest: pg.Rect, worm_positions: List[Tuple[float, float]], cam_rect: pg.Rect | None = None) -> None:
+    def draw_minimap(self, surf: pg.Surface, dest: pg.Rect, worm_positions: List[Tuple[float, float]], cam_rect: pg.Rect | None = None, worm_ready_flags: List[bool] | None = None) -> None:
         # Draw a scaled overview of world
         pg.draw.rect(surf, (12, 16, 28), dest)
         pg.draw.rect(surf, (40, 50, 80), dest, width=1)
@@ -296,11 +296,13 @@ class Maze:
             px = dest.x + int(f.x * sx)
             py = dest.y + int(f.y * sy)
             surf.fill((80, 180, 100), (px, py, 2, 2))
-        # Worms as white dots
-        for wp in worm_positions:
+        # Worms as dots; ready-to-mate in pink
+        flags = worm_ready_flags if worm_ready_flags is not None else [False] * len(worm_positions)
+        for idx, wp in enumerate(worm_positions):
             wx = dest.x + int(wp[0] * sx)
             wy = dest.y + int(wp[1] * sy)
-            pg.draw.circle(surf, (240, 250, 255), (wx, wy), 3)
+            col = (255, 120, 180) if (idx < len(flags) and flags[idx]) else (240, 250, 255)
+            pg.draw.circle(surf, col, (wx, wy), 3)
         # Camera rect
         if cam_rect is not None:
             cr = pg.Rect(

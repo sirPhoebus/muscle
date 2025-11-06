@@ -1,0 +1,481 @@
+@dataclass
+class Segment:
+    pos: np.ndarray  # shape (2,)
+    dir: float       # heading angle radians
+    left: MuscleFiber
+    right: MuscleFiber
+
+
+class Worm:
+    def __init__(self, origin: Tuple[float, float], heading: float, params: Params, color: Tuple[int, int, int] | None = None, 
+                 segments: int | None = None, body_radius: float | None = None, seg_spacing: float | None = None):
+        # Each worm has its own genetic parameters
+        self.params = params
+        
+        # Physical characteristics based on genetics
+        self.num_segments = segments if segments is not None else BASE_SEGMENTS
+        self.body_radius = body_radius if body_radius is not None else BASE_BODY_RADIUS
+        self.seg_spacing = seg_spacing if seg_spacing is not None else BASE_SEG_SPACING
+        
+        self.segs: List[Segment] = []
+        x, y = origin
+        for i in range(self.num_segments):
+            pos = np.array([x - i * self.seg_spacing * math.cos(heading), y - i * self.seg_spacing * math.sin(heading)], dtype=float)
+            self.segs.append(Segment(pos=pos, dir=heading, left=MuscleFiber(), right=MuscleFiber()))
+        
+        # One neuron per fiber band on the head (optional); plus global background neuron
+        self.head_neuron_L = Neuron(interval_ms=params.head_interval_ms, k_gain=params.k_gain_head)
+        self.head_neuron_R = Neuron(interval_ms=params.head_interval_ms, k_gain=params.k_gain_head)
+        self.bg_neuron = Neuron(interval_ms=params.bg_interval_ms, k_gain=params.k_gain_bg)
+        self.brain = Brain(interval_ms=params.brain_interval_ms)
+        self.paused = False
+        self.color = color if color is not None else (230, 232, 245)
+        # Random phase offset so worms don't all wiggle in sync
+        self.phase_offset = np.random.uniform(0, 2 * math.pi)
+        # Cache last sensor distances (for HUD/drawing)
+        self.last_sensor_L: float = params.sensor_range
+        self.last_sensor_R: float = params.sensor_range
+        self.last_sensor_origin_L: Tuple[float, float] = origin
+        self.last_sensor_origin_R: Tuple[float, float] = origin
+        self.last_sensor_fan: List[Tuple[Tuple[float, float], float, float]] = []  # (origin, angle, dist)
+        self.last_food_target: Tuple[float, float] | None = None
+        # Targeting and avoidance of unreachable foods
+        self.current_target: Food | None = None
+        self.target_start_t: float = 0.0
+        self.target_start_dist: float = float('inf')
+        self.target_best_dist: float = float('inf')
+        self.avoid_food_until: dict[int, float] = {}
+        # Apply muscle params using own genetics
+        self.apply_muscle_params(self.params)
+        # Life sim state
+        self.alive: bool = True
+        self.food_eaten: int = 0
+        self.time_since_last_eat: float = 0.0
+        self.ready_to_mate: bool = False
+        self.last_repro_time: float = -1e6
+        # Speed meter
+        self.current_speed: float = 0.0
+        self.speed_ema: float = 0.0
+        self.max_speed: float = 0.0
+
+    def dna_values(self) -> List[float]:
+        # Normalize configured genetic parameters 0..1 for DNA bars
+        vals: List[float] = []
+        p = self.params
+        for name, mn, mx in DNA_SPECS:
+            v = getattr(p, name)
+            # Cast ints to float for normalization
+            vf = float(v)
+            if mx <= mn:
+                n = 0.0
+            else:
+                n = (vf - mn) / (mx - mn)
+            # clamp
+            n = 0.0 if n < 0.0 else (1.0 if n > 1.0 else n)
+            vals.append(n)
+        return vals
+
+    def draw_dna_tag(self, surf: pg.Surface, cam: Tuple[float, float]) -> None:
+        # Visual DNA tag above head: multicolored bars, heights 0..1
+        hx, hy = self.head_pos()
+        cx, cy = cam
+        x = int(hx - cx)
+        y = int(hy - cy)
+        bars = self.dna_values()
+        if not bars:
+            return
+        # Layout
+        bar_w = 4
+        gap = 2
+        padding = 6
+        max_h = 28
+        total_w = len(bars) * bar_w + (len(bars) - 1) * gap + 2 * padding
+        total_h = max_h + 2 * padding
+        # Position tag centered above head
+        tag_x = x - total_w // 2
+        tag_y = y - int(self.body_radius) - total_h - 6
+        rect = pg.Rect(tag_x, tag_y, total_w, total_h)
+        # Save for hit-testing (screen space)
+        self.last_tag_rect = rect.copy()
+        # Background and border
+        bg = (18, 22, 32)
+        bd = (70, 80, 110) if not self.ready_to_mate else (70, 160, 90)
+        radius = 8
+        pg.draw.rect(surf, bg, rect, border_radius=radius)
+        pg.draw.rect(surf, bd, rect, width=1, border_radius=radius)
+        # Draw bars bottom-aligned inside rect
+        bx = tag_x + padding
+        by = tag_y + padding
+        for i, n in enumerate(bars):
+            h = int(max(1, n * max_h))
+            col = DNA_COLORS[i % len(DNA_COLORS)]
+            bx_i = bx + i * (bar_w + gap)
+            by_i = by + (max_h - h)
+            pg.draw.rect(surf, col, pg.Rect(bx_i, by_i, bar_w, h), border_radius=2)
+        # Food eaten counter (small text) and speed meter
+        try:
+            if not hasattr(Worm, "_dna_font"):
+                Worm._dna_font = pg.font.SysFont(None, 12)
+            font = Worm._dna_font
+            txt = font.render(f"F:{self.food_eaten}", True, (220, 230, 240))
+            surf.blit(txt, (tag_x + 6, tag_y + 4))
+            spd = font.render(f"S:{int(self.speed_ema):d}", True, (210, 220, 255))
+            surf.blit(spd, (tag_x + rect.w - 36, tag_y + 4))
+        except Exception:
+            pass
+
+    def apply_muscle_params(self, params: Params) -> None:
+        for seg in self.segs:
+            seg.left.baseline = params.muscle_baseline
+            seg.left.gain = params.muscle_gain
+            seg.left.gamma = params.muscle_gamma
+            seg.right.baseline = params.muscle_baseline
+            seg.right.gain = params.muscle_gain
+            seg.right.gamma = params.muscle_gamma
+
+    def head_pos(self) -> Tuple[float, float]:
+        p = self.segs[0].pos
+        return float(p[0]), float(p[1])
+
+    def head_dir(self) -> float:
+        return self.segs[0].dir
+
+    def update(self, dt_ms: int, t_sec: float, maze: Maze) -> None:
+        params = self.params  # Use worm's own genetic parameters
+        if not self.alive:
+            return
+        if self.paused:
+            return
+        dt = dt_ms / 1000.0
+        # Starvation timer
+        self.time_since_last_eat += dt
+        if self.time_since_last_eat >= STARVATION_TIME_S:
+            self.alive = False
+            return
+
+        # Sensor rays from head (throttled)
+        hx, hy = self.head_pos()
+        hdir = self.head_dir()
+        sensor_fov = math.radians(params.sensor_fov_deg)
+        # Determine if we should recompute sensors this frame
+        # Throttle based on worm id to stagger updates
+        if not hasattr(self, "_sensor_frame_mod"):
+            self._sensor_frame_mod = np.random.randint(0, 3)
+        recompute = (int(t_sec * 60) + self._sensor_frame_mod) % 3 == 0
+        if recompute:
+            # Build a fan of rays across [-FOV, +FOV]
+            n = max(3, int(params.sensor_fan_rays))
+            # Dynamic cap to reduce cost with many agents
+            n = int(max(3, min(n, 9)))
+            if n % 2 == 0:
+                n += 1  # prefer odd to have a center ray
+            fan: List[Tuple[Tuple[float, float], float, float]] = []
+            for i in range(n):
+                t = -1.0 + 2.0 * (i / max(1, n - 1))  # -1..1
+                ang = hdir + t * sensor_fov
+                tip = (hx + self.body_radius * math.cos(ang), hy + self.body_radius * math.sin(ang))
+                d = maze.raycast(tip, ang, params.sensor_range)
+                fan.append((tip, ang, d))
+            self.last_sensor_fan = fan
+            # Derive endpoints
+            angL = hdir - sensor_fov
+            angR = hdir + sensor_fov
+            tipL = (hx + self.body_radius * math.cos(angL), hy + self.body_radius * math.sin(angL))
+            tipR = (hx + self.body_radius * math.cos(angR), hy + self.body_radius * math.sin(angR))
+            dL = maze.raycast(tipL, angL, params.sensor_range)
+            dR = maze.raycast(tipR, angR, params.sensor_range)
+            tipC = (hx + self.body_radius * math.cos(hdir), hy + self.body_radius * math.sin(hdir))
+            dC = maze.raycast(tipC, hdir, params.sensor_range)
+            self._last_dists = (dL, dR, dC)
+            # cache for drawing
+            self.last_sensor_L = dL
+            self.last_sensor_R = dR
+            self.last_sensor_origin_L = tipL
+            self.last_sensor_origin_R = tipR
+        else:
+            # Reuse last results if available
+            dL, dR, dC = getattr(self, "_last_dists", (params.sensor_range, params.sensor_range, params.sensor_range))
+            self.last_sensor_L = dL
+            self.last_sensor_R = dR
+        # Sensor bias: steer away from nearer obstacle
+        bias = 0.0
+        # Vector-field avoidance using the multi-ray fan
+        win = max(1.0, params.sensor_end_contact_px)
+        rep_x = rep_y = 0.0
+        cEndC = max(0.0, min(1.0, (win - dC) / win))
+        for (tip, ang, dist) in self.last_sensor_fan:
+            c = max(0.0, min(1.0, (win - dist) / win))
+            if c <= 0.0:
+                continue
+            w = (c * c)
+            rep_x += -w * math.cos(ang)
+            rep_y += -w * math.sin(ang)
+        lat_x = -math.sin(hdir)
+        lat_y = math.cos(hdir)
+        rep_lat = rep_x * lat_x + rep_y * lat_y
+        bias += params.avoid_turn_gain * rep_lat
+        # Legacy near-head avoidance as a mild backup when very close
+        if min(dL, dR) < params.avoidance_threshold:
+            bias += 0.5 * params.steer_gain * (dR - dL) / max(1.0, params.sensor_range)
+        # When neurons are disabled, there is no neural drive to effect steering
+        if not params.neurons_enabled:
+            bias = 0.0
+
+        # Food attraction: steer toward resultant vector of nearby foods (spatial query)
+        if params.neurons_enabled and params.attract_gain > 0.0:
+            hx, hy = self.head_pos()
+            acc = np.array([0.0, 0.0], dtype=float)
+            for f in maze.foods_near(hx, hy, params.food_range):
+                dx = f.x - hx
+                dy = f.y - hy
+                dist = math.hypot(dx, dy)
+                if dist > 1e-3:
+                    w = max(0.0, 1.0 - dist / params.food_range)
+                    acc[0] += (w / dist) * dx
+                    acc[1] += (w / dist) * dy
+            mag = float(np.linalg.norm(acc))
+            if mag > 1e-6:
+                acc /= mag
+                target_ang = math.atan2(acc[1], acc[0])
+                # smallest signed angle difference
+                ang = target_ang - hdir
+                while ang > math.pi:
+                    ang -= 2 * math.pi
+                while ang < -math.pi:
+                    ang += 2 * math.pi
+                # scale by gain and attraction magnitude (cap at 1)
+                bias += params.attract_gain * (ang / math.pi) * min(1.0, mag)
+
+        # Brain: integrate sensors and exact food vector for steering and twitches
+        if params.neurons_enabled and params.brain_gain > 0.0:
+            # Determine target food, prefer existing unless eaten/invalid or on cooldown
+            hx, hy = self.head_pos()
+            now = t_sec
+            # Helper to check if a food is avoid-listed
+            def _is_avoided(f: Food) -> bool:
+                until = self.avoid_food_until.get(id(f))
+                return until is not None and now < until
+
+            # Validate current target
+            if self.current_target is None or self.current_target.eaten or _is_avoided(self.current_target):
+                self.current_target = None
+            # Select nearest non-avoided food if no current target
+            if self.current_target is None:
+                best_f: Food | None = None
+                best_d = float('inf')
+                for f in maze.foods_near(hx, hy, params.food_range):
+                    if _is_avoided(f):
+                        continue
+                    d = math.hypot(f.x - hx, f.y - hy)
+                    if d < best_d:
+                        best_d = d
+                        best_f = f
+                if best_f is not None:
+                    self.current_target = best_f
+                    self.target_start_t = now
+                    self.target_start_dist = best_d
+                    self.target_best_dist = best_d
+
+            # Compute angle and distance to current target
+            nearest_ang = 0.0
+            nearest_dist = float('inf')
+            nearest_xy = None
+            if self.current_target is not None:
+                dx = self.current_target.x - hx
+                dy = self.current_target.y - hy
+                nearest_dist = math.hypot(dx, dy)
+                nearest_ang = math.atan2(dy, dx) - hdir
+                nearest_xy = (self.current_target.x, self.current_target.y)
+                # Track progress and detect stuck
+                if nearest_dist < self.target_best_dist:
+                    self.target_best_dist = nearest_dist
+                elapsed = now - self.target_start_t
+                improved = self.target_start_dist - self.target_best_dist
+                if (elapsed >= params.brain_stuck_timeout_s and
+                    improved < params.brain_stuck_min_improve_px and
+                    nearest_dist > self.body_radius * 1.3):
+                    # Mark as avoided for cooldown and drop target
+                    self.avoid_food_until[id(self.current_target)] = now + params.brain_target_cooldown_s
+                    self.current_target = None
+
+            while nearest_ang > math.pi:
+                nearest_ang -= 2 * math.pi
+            while nearest_ang < -math.pi:
+                nearest_ang += 2 * math.pi
+            self.last_food_target = nearest_xy if nearest_xy is not None else None
+
+            out = self.brain.update(
+                dt_ms,
+                dL,
+                dR,
+                nearest_ang,
+                nearest_dist if nearest_dist != float('inf') else params.food_range,
+                params.sensor_range,
+                params.food_range,
+            )
+            bias += params.brain_gain * out.steer
+            # Convert brain twitches to head fiber twitches
+            if out.twitch_left > 0.0:
+                amp = max(0.0, min(1.0, out.twitch_left * params.brain_twitch_gain))
+                r, h, d = compute_twitch_timing(amp)
+                self.segs[0].left.trigger(Twitch(target=amp, rise=r, hold=h, decay=d))
+            if out.twitch_right > 0.0:
+                amp = max(0.0, min(1.0, out.twitch_right * params.brain_twitch_gain))
+                r, h, d = compute_twitch_timing(amp)
+                self.segs[0].right.trigger(Twitch(target=amp, rise=r, hold=h, decay=d))
+
+        if params.neurons_enabled:
+            # Background neuron occasionally creates twitch on random mid-body segment
+            tw = self.bg_neuron.update(dt_ms)
+            if tw is not None:
+                idx = np.random.randint(2, self.num_segments)
+                # pick left or right randomly
+                if np.random.rand() < 0.5:
+                    self.segs[idx].left.trigger(tw)
+                else:
+                    self.segs[idx].right.trigger(tw)
+
+            # Head-specific neurons modulate L/R for more variety
+            twL = self.head_neuron_L.update(dt_ms)
+            if twL is not None:
+                self.segs[0].left.trigger(twL)
+            twR = self.head_neuron_R.update(dt_ms)
+            if twR is not None:
+                self.segs[0].right.trigger(twR)
+        else:
+            # When disabled, clear active twitches and zero activations
+            for seg in self.segs:
+                seg.left.twitch = None
+                seg.right.twitch = None
+                seg.left.activation = 0.0
+                seg.right.activation = 0.0
+
+        # Drive undulatory gait + steering
+        omega = 2.0 * math.pi * params.wave_freq
+        for i, seg in enumerate(self.segs):
+            phase = omega * t_sec + i * WAVE_PHASE_PER_SEG + self.phase_offset
+            # When neurons are disabled, suppress the central pattern drive
+            # Reduce gait amplitude near obstacles to help turning
+            # Use maximum closeness over the sensor fan (including center)
+            avoid_strength = cEndC
+            for (_, _, dist) in self.last_sensor_fan:
+                avoid_strength = max(avoid_strength, max(0.0, min(1.0, (max(1.0, params.sensor_end_contact_px) - dist) / max(1.0, params.sensor_end_contact_px))))
+            amp_scale = 1.0 - 0.5 * avoid_strength
+            base = ((math.sin(phase) * params.wave_amp) * amp_scale) if params.neurons_enabled else 0.0
+            # Steering bias: positive bias increases left activation (turn left)
+            if params.neurons_enabled:
+                seg.left.update()
+                seg.right.update()
+            left_a = np.clip(base + bias + seg.left.activation, 0.0, 1.0)
+            right_a = np.clip(-base - bias + seg.right.activation, 0.0, 1.0)
+            # Convert L/R activation delta to curvature; scaled by joint flex
+            turn = (left_a - right_a) * 0.25 * max(0.1, params.joint_flex)
+            seg.dir += turn * dt
+
+        # Kinematics: head moves forward; each next segment follows previous at fixed spacing
+        # Forward speed from head undulation; halt when neurons are disabled
+        head_speed = 0.0 if not params.neurons_enabled else (
+            params.forward_gain * (0.35 + 0.65 * abs(math.sin(omega * t_sec + self.phase_offset)))
+        )
+        # Slow down as antenna ends approach obstacles to avoid collisions; do not fully stop
+        if params.neurons_enabled:
+            avoid_strength = cEndC
+            for (_, _, dist) in self.last_sensor_fan:
+                avoid_strength = max(avoid_strength, max(0.0, min(1.0, (max(1.0, params.sensor_end_contact_px) - dist) / max(1.0, params.sensor_end_contact_px))))
+            slow = max(0.0, 1.0 - params.avoid_slow_gain * avoid_strength)
+            head_speed *= max(params.min_forward_frac, slow)
+        # Update speedmeter
+        self.current_speed = float(head_speed)
+        self.speed_ema = 0.85 * self.speed_ema + 0.15 * self.current_speed
+        if self.current_speed > self.max_speed:
+            self.max_speed = self.current_speed
+        vx = head_speed * math.cos(self.segs[0].dir)
+        vy = head_speed * math.sin(self.segs[0].dir)
+        self.segs[0].pos += np.array([vx * dt, vy * dt])
+
+        # Obstacle/border response: make a 60° turn away and extricate slightly
+        if maze.collide_circle(self.head_pos(), self.body_radius):
+            # Choose turn direction based on which antenna side is freer
+            turn_sign = 1.0 if dL > dR else -1.0
+            self.segs[0].dir += turn_sign * math.radians(60.0)
+            ndir = self.segs[0].dir
+            # small extrication step along new heading to get out of contact
+            step_out = self.body_radius * 0.9
+            self.segs[0].pos += np.array([math.cos(ndir) * step_out, math.sin(ndir) * step_out])
+
+        # Follow-the-leader for the rest
+        for i in range(1, self.num_segments):
+            prev = self.segs[i - 1]
+            cur = self.segs[i]
+            delta = prev.pos - cur.pos
+            dist = np.linalg.norm(delta)
+            if dist < 1e-6:
+                continue
+            dir_vec = delta / dist
+            target = prev.pos - dir_vec * self.seg_spacing
+            # springlike follow; higher joint_flex lowers stiffness to allow more bend
+            follow_gain = 10.0 / max(0.2, params.joint_flex)
+            cur.pos += (target - cur.pos) * min(1.0, follow_gain * dt)
+            cur.dir = math.atan2(prev.pos[1] - cur.pos[1], prev.pos[0] - cur.pos[0])
+
+        # Eat food: consume items very near head
+        hx, hy = self.head_pos()
+        eat_r = self.body_radius * 1.2
+        er2 = eat_r * eat_r
+        for f in maze.foods_near(hx, hy, eat_r):
+            dx = f.x - hx
+            dy = f.y - hy
+            if (dx * dx + dy * dy) <= er2 and not f.eaten:
+                maze.mark_food_eaten(f)
+                self.food_eaten += 1
+                self.time_since_last_eat = 0.0
+                if self.food_eaten >= REPRODUCTION_FOOD_REQUIRED:
+                    self.ready_to_mate = True
+
+    def draw(self, surf: pg.Surface, cam: Tuple[float, float], draw_sensors: bool = False, draw_dna: bool = False, lite_mode: bool = False) -> None:
+        params = self.params  # Use worm's own genetic parameters
+        if not self.alive:
+            return
+        # Draw sensors (only for main worm)
+        if draw_sensors:
+            hx, hy = self.head_pos()
+            hdir = self.head_dir()
+            sensor_fov = math.radians(params.sensor_fov_deg)
+            cx, cy = cam
+            # draw sensor fan rays up to measured distances
+            col = (160, 190, 255)
+            for (origin, ang, dist) in getattr(self, 'last_sensor_fan', []):
+                ox, oy = origin
+                ex = ox + dist * math.cos(ang)
+                ey = oy + dist * math.sin(ang)
+                pg.draw.line(surf, col, (int(ox - cx), int(oy - cy)), (int(ex - cx), int(ey - cy)), 1)
+
+        # Draw body segments with simple shading indicating left/right activation
+        cx, cy = cam
+        segs_iter = list(reversed(self.segs))
+        step = 3 if lite_mode else 1
+        for idx in range(0, len(segs_iter), step):
+            seg = segs_iter[idx]
+            # back to front - use worm's own body radius
+            r = self.body_radius * (0.9 + 0.12 * math.sin(0.6 * idx))
+            x, y = float(seg.pos[0]) - cx, float(seg.pos[1]) - cy
+            # base body with worm's color
+            body_col = self.color if not getattr(self, 'ready_to_mate', False) else (255, 120, 180)
+            pg.draw.circle(surf, body_col, (int(x), int(y)), int(r))
+            if not lite_mode:
+                # dorsal/ventral shading by left/right activations
+                lcol = (255, 120, 110)
+                rcol = (210, 220, 230)
+                la = int(255 * seg.left.activation)
+                ra = int(255 * seg.right.activation)
+                # left/right small arcs
+                angle = seg.dir
+                lx = x + 0.5 * r * math.cos(angle + math.pi / 2)
+                ly = y + 0.5 * r * math.sin(angle + math.pi / 2)
+                rx = x + 0.5 * r * math.cos(angle - math.pi / 2)
+                ry = y + 0.5 * r * math.sin(angle - math.pi / 2)
+                pg.draw.circle(surf, (lcol[0], max(0, lcol[1] - (255 - la)), max(0, lcol[2] - (255 - la))), (int(lx), int(ly)), int(max(3, 0.35 * r)))
+                pg.draw.circle(surf, (rcol[0], max(0, rcol[1] - (255 - ra)), max(0, rcol[2] - (255 - ra))), (int(rx), int(ry)), int(max(3, 0.35 * r)))
+
+        # Draw DNA tag above the head
+        if draw_dna:
